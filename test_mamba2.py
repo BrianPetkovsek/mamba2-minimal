@@ -547,7 +547,7 @@ def test_seq_idx_parameter():
     # Test with contiguous seq_idx (normal case)
     seq_idx_contiguous = torch.arange(seqlen)
     with torch.no_grad():
-        y_contiguous, _ = model(x, seq_idx=seq_idx_contiguous)
+        y_contiguous, h_contiguous = model(x, seq_idx=seq_idx_contiguous)
     
     assert y_contiguous.shape == x.shape, "Output should have correct shape with seq_idx"
     
@@ -560,17 +560,20 @@ def test_seq_idx_parameter():
     ])
     
     with torch.no_grad():
-        y_noncontiguous, _ = model(x, seq_idx=seq_idx_noncontiguous)
+        y_noncontiguous, h_noncontiguous = model(x, seq_idx=seq_idx_noncontiguous)
     
     assert y_noncontiguous.shape == x.shape, "Output should have correct shape with non-contiguous seq_idx"
     
-    # Results should be different for contiguous vs non-contiguous
-    # (because non-contiguous should break state propagation between chunks)
-    max_diff = torch.abs(y_contiguous - y_noncontiguous).max().item()
-    # We expect some difference due to different inter-chunk state propagation
-    # The difference might be small or large depending on the specific values
+    # Check that SSM states are different (indicating seq_idx logic is working)
+    # The final outputs might be similar due to subsequent processing, but SSM states should differ
+    ssm_state_diff = torch.abs(h_contiguous.ssm_state - h_noncontiguous.ssm_state).max().item()
+    output_diff = torch.abs(y_contiguous - y_noncontiguous).max().item()
     
-    print(f"  Max diff between contiguous and non-contiguous seq_idx: {max_diff:.6f}")
+    # SSM states should be detectably different when chunks are non-contiguous
+    assert ssm_state_diff > 1e-6, f"SSM states should differ for non-contiguous seq_idx, got diff={ssm_state_diff}"
+    
+    print(f"  SSM state max diff: {ssm_state_diff:.6f}")
+    print(f"  Output max diff: {output_diff:.6f}")
     print("✓ seq_idx parameter test passed")
 
 

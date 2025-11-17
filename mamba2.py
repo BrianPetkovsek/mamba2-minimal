@@ -765,42 +765,64 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, seq_idx=None, device: Devic
     # Compute A_cumsum at chunk boundaries for inter-chunk decay
     A_cumsum_last = A_cumsum[:, :, :, -1]  # (batch, nheads, nchunks)
     
-    # Handle seq_idx for proper chunk boundary behavior
-    # seq_idx indicates global sequence positions; when chunks are non-contiguous,
-    # we need to reset the SSM state propagation
-    if seq_idx is not None:
-        # seq_idx shape: (seqlen,) containing global position indices
-        # Reshape to identify chunk boundaries
-        seq_idx_chunks = rearrange(seq_idx, "(c l) -> c l", l=chunk_size)
-        # Get the last position of each chunk and first position of next chunk
-        last_positions = seq_idx_chunks[:, -1]  # (nchunks,)
-        first_positions = seq_idx_chunks[:, 0]  # (nchunks,)
-        
-        # Check continuity: chunk i and i+1 are contiguous if last_pos[i] + 1 == first_pos[i+1]
-        # Shift first_positions to align with prev chunk's last position
-        is_contiguous = torch.ones(A_cumsum_last.shape[-1] + 1, dtype=torch.bool, device=device)
-        if len(last_positions) > 1:
-            # Compare last of chunk i with first of chunk i+1
-            is_contiguous[1:-1] = (last_positions[:-1] + 1) == first_positions[1:]
-        # is_contiguous[0] is for initial state (always keep)
-        # is_contiguous[i] tells if we should propagate from chunk i-1 to chunk i
-        
-        # Create a mask to zero out non-contiguous transitions
-        # We'll apply this after computing decay_chunk
-        contiguity_mask = is_contiguous.float()  # (nchunks+1,)
-        # Expand to match decay_chunk dimensions: (batch, nheads, nchunks+1, nchunks+1)
-        contiguity_mask = contiguity_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
-    
     # Compute decay for inter-chunk recurrence using segsum
     # Pad A_cumsum_last with 0 at the beginning for initial state
-    decay_chunk = torch.exp(segsum(F.pad(A_cumsum_last, (1, 0)), device=device))
+    # segsum will compute the cumulative sum in the lower triangular part
+    A_cumsum_padded = F.pad(A_cumsum_last, (1, 0))  # (batch, nheads, nchunks+1)
+    
+    # Handle seq_idx for proper chunk boundary behavior
+    # The key insight: seq_idx determines which chunks are contiguous in the global sequence
+    # Non-contiguous chunks should not propagate states between them
+    if seq_idx is not None and seq_idx.numel() > 0:
+        # seq_idx shape: (seqlen,) containing global position indices
+        # Reshape to identify chunk boundaries
+        nchunks = A_cumsum_last.shape[-1]
+        seq_idx_chunks = rearrange(seq_idx, "(c l) -> c l", l=chunk_size)
+        
+        # Get the first and last position index of each chunk
+        chunk_start_idx = seq_idx_chunks[:, 0]  # (nchunks,)
+        chunk_end_idx = seq_idx_chunks[:, -1]  # (nchunks,)
+        
+        # Check if consecutive chunks are contiguous:
+        # chunk i and chunk i+1 are contiguous if end_idx[i] + 1 == start_idx[i+1]
+        # Build a mask for the segsum computation
+        # is_boundary_break[i] = True means there's a break between chunk i-1 and chunk i
+        is_boundary_break = torch.zeros(nchunks + 1, dtype=torch.bool, device=device)
+        if nchunks > 1:
+            # Check each consecutive pair
+            is_boundary_break[1:] = (chunk_end_idx[:-1] + 1) != torch.cat([chunk_start_idx[1:], chunk_start_idx[-1:]])
+            is_boundary_break[1:nchunks] = (chunk_end_idx[:-1] + 1) != chunk_start_idx[1:]
+        
+        # Where there's a boundary break, we need to reset the cumsum in segsum
+        # We do this by subtracting the cumsum value at the break point
+        # This effectively resets the cumsum to 0 at that point
+        # Modify A_cumsum_padded to encode breaks
+        for i in range(1, nchunks + 1):
+            if is_boundary_break[i]:
+                # There's a break between chunk i-1 and chunk i
+                # We want to zero out the propagation from all chunks before i to chunk i and after
+                # We do this by inserting a -inf barrier in the segsum
+                # Actually, we should reset the cumulative sum at this point
+                # Set A_cumsum_padded[..., i] such that the cumsum resets
+                # The way segsum works, if we set a value to reset the pattern, we need to
+                # ensure that the lower triangular sum doesn't propagate past this point
+                # A simpler approach: modify the segsum result directly after computation
+                pass  # We'll handle this after segsum
+    
+    # Compute the base decay_chunk
+    decay_chunk = torch.exp(segsum(A_cumsum_padded, device=device))
     # decay_chunk shape: (batch, nheads, nchunks+1, nchunks+1)
     
-    # Apply seq_idx mask if provided
-    if seq_idx is not None:
-        # Zero out transitions from non-contiguous chunks
-        # The mask should be applied to the "source" dimension of decay_chunk
-        decay_chunk = decay_chunk * contiguity_mask
+    # Apply seq_idx masking if needed
+    if seq_idx is not None and seq_idx.numel() > 0:
+        # For each boundary break, zero out the appropriate entries in decay_chunk
+        # decay_chunk[b, h, i, j] represents the decay from chunk j to chunk i
+        # If there's a break at position k (between chunk k-1 and k), then
+        # decay_chunk[..., i, j] should be 0 for all i >= k and j < k
+        for i in range(1, nchunks + 1):
+            if is_boundary_break[i]:
+                # Zero out propagation from chunks before i to chunks at i and after
+                decay_chunk[:, :, i:, :i] = 0
     
     new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]
