@@ -136,7 +136,7 @@ def mamba_split_conv1d_scan_combined(
     seq_idx: Tensor | None = None,
     initial_states: Tensor | None = None,
     device: Device = None,
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
     """Pure PyTorch implementation of mamba_split_conv1d_scan_combined.
     
     This fused operation combines:
@@ -174,6 +174,7 @@ def mamba_split_conv1d_scan_combined(
     
     Returns:
         out: (batch, seqlen, d_model) output
+        final_state: (batch, nheads, headdim, d_state) final SSM state
     """
     batch, seqlen, _ = zxbcdt.shape
     
@@ -238,7 +239,7 @@ def mamba_split_conv1d_scan_combined(
     if outproj_weight is not None:
         y = F.linear(y, outproj_weight, outproj_bias)
     
-    return y
+    return y, final_state
 
 
 class Mamba2LMHeadModel(nn.Module):
@@ -467,7 +468,7 @@ class Mamba2(nn.Module):
         
         # Use fused path if enabled
         if self.args.use_mem_eff_path:
-            y = mamba_split_conv1d_scan_combined(
+            y, ssm_state = mamba_split_conv1d_scan_combined(
                 zxbcdt,
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
                 self.conv1d.bias,
@@ -492,7 +493,7 @@ class Mamba2(nn.Module):
                 device=self.device,
             )
             
-            # For inference cache, we need to compute conv_state and ssm_state
+            # For inference cache, we need to compute conv_state
             # Conv state: last d_conv positions of xBC
             z, xBC, dt = torch.split(
                 zxbcdt,
@@ -505,11 +506,6 @@ class Mamba2(nn.Module):
             )
             conv_state = F.pad(
                 rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - u.shape[1], 0)
-            )
-            # SSM state: for simplicity, allocate zeros (proper implementation would return from fused kernel)
-            ssm_state = torch.zeros(
-                batch, self.args.nheads, self.args.headdim, self.args.d_state, 
-                device=self.device
             )
             
             h = InferenceCache(conv_state, ssm_state)
@@ -631,23 +627,21 @@ class Mamba2(nn.Module):
         dA = torch.exp(dt * A)  # (batch, nheads)
         x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
         
-        # For ngroups support in step: we need to handle the grouped B and C
+        # For ngroups support in step: expand B and C to per-head shapes
         # When ngroups > 1, B and C have shape (batch, ngroups * d_state)
-        # The SSM state update needs to be computed per group
-        if self.args.ngroups == 1:
-            dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
-            h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-            y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
-        else:
+        # We need to repeat groups to match heads
+        if self.args.ngroups < self.args.nheads:
             # Reshape B and C for groups
             B_grouped = rearrange(B, "b (g n) -> b g n", g=self.args.ngroups)
             C_grouped = rearrange(C, "b (g n) -> b g n", g=self.args.ngroups)
-            # Average over groups for the SSM computation (this is a simplification)
-            B_avg = B_grouped.mean(dim=1)  # (batch, d_state)
-            C_avg = C_grouped.mean(dim=1)  # (batch, d_state)
-            dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B_avg, x)
-            h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-            y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C_avg)
+            # Repeat groups to heads
+            heads_per_group = self.args.nheads // self.args.ngroups
+            B = repeat(B_grouped, "b g n -> b (g h) n", h=heads_per_group)
+            C = repeat(C_grouped, "b g n -> b (g h) n", h=heads_per_group)
+        
+        dBx = torch.einsum("bh, bhn, bhp -> bhpn", dt, B, x)
+        h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+        y = torch.einsum("bhpn, bhn -> bhp", h.ssm_state, C)
             
         y = y + rearrange(self.D, "h -> h 1") * x
         y = rearrange(y, "b h p -> b (h p)")

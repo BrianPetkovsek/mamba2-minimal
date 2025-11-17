@@ -358,7 +358,75 @@ def test_fused_vs_simple_path():
     assert torch.allclose(y_fused, y_simple, rtol=1e-4, atol=1e-5), \
         f"Fused and simple paths should match, max diff: {torch.abs(y_fused - y_simple).max()}"
     
+    # SSM states should also be close (not zeros from fused path)
+    assert not torch.allclose(h_fused.ssm_state, torch.zeros_like(h_fused.ssm_state)), \
+        "Fused path should return non-zero SSM states"
+    
     print("✓ Fused vs simple path test passed")
+
+
+def test_fused_path_returns_states():
+    """Test that fused path returns proper SSM final states."""
+    print("\nTesting fused path returns proper SSM states...")
+    torch.manual_seed(42)
+    
+    config = Mamba2Config(d_model=128, use_mem_eff_path=True, ngroups=2, chunk_size=64)
+    model = Mamba2(config)
+    model.eval()
+    
+    batch, seqlen = 2, 64
+    x = torch.randn(batch, seqlen, 128)
+    
+    with torch.no_grad():
+        y, h = model(x)
+    
+    # SSM state should not be zeros (it's computed from SSD)
+    assert not torch.allclose(h.ssm_state, torch.zeros_like(h.ssm_state)), \
+        "Fused path should return non-zero SSM states from SSD"
+    
+    # Clone the state before step to compare
+    h_ssm_before = h.ssm_state.clone()
+    
+    # Test that we can use these states for inference
+    u = torch.randn(batch, 1, 128)
+    with torch.no_grad():
+        y_step, h_step = model(u, h)
+    
+    assert y_step.shape == (batch, 1, 128), "Step output shape should be correct"
+    # Note: h_step.ssm_state is the same object as h.ssm_state (modified in place by copy_)
+    # So we compare against the cloned before state
+    assert not torch.allclose(h_step.ssm_state, h_ssm_before, rtol=1e-5, atol=1e-6), \
+        "SSM state should be updated after step"
+    
+    print("✓ Fused path returns proper SSM states test passed")
+
+
+def test_step_ngroups_no_averaging():
+    """Test that step() properly handles ngroups without averaging."""
+    print("\nTesting step() ngroups handling...")
+    torch.manual_seed(42)
+    
+    # Test with ngroups=2
+    config = Mamba2Config(d_model=128, ngroups=2, chunk_size=64)
+    model = Mamba2(config)
+    model.eval()
+    
+    from mamba2 import InferenceCache
+    
+    batch = 2
+    h = InferenceCache.alloc(batch, config)
+    
+    # Do a few steps
+    for i in range(5):
+        u = torch.randn(batch, 1, 128)
+        with torch.no_grad():
+            y, h = model(u, h)
+        
+        # Check that SSM state is being updated
+        assert not torch.allclose(h.ssm_state, torch.zeros_like(h.ssm_state)), \
+            f"SSM state should be non-zero after step {i+1}"
+    
+    print("✓ Step ngroups handling test passed")
 
 
 def run_all_tests():
@@ -378,6 +446,8 @@ def run_all_tests():
     test_ssd_numerical()
     test_config_defaults()
     test_fused_vs_simple_path()
+    test_fused_path_returns_states()
+    test_step_ngroups_no_averaging()
     
     print("\n" + "=" * 60)
     print("All tests passed! ✓")
