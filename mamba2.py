@@ -771,12 +771,10 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, seq_idx=None, device: Devic
     A_cumsum_padded = F.pad(A_cumsum_last, (1, 0))  # (batch, nheads, nchunks+1)
     
     # Compute the base decay_chunk first
+    # Prepare decay_chunk
     decay_chunk = torch.exp(segsum(A_cumsum_padded, device=device))
-    # decay_chunk shape: (batch, nheads, nchunks+1, nchunks+1)
-    
-    # Handle seq_idx for proper chunk boundary behavior
-    # The key insight: seq_idx determines which chunks are contiguous in the global sequence
-    # Non-contiguous chunks should not propagate states between them
+
+    # Handle seq_idx for proper chunk boundary behavior (vectorized)
     if seq_idx is not None and seq_idx.numel() > 0:
         # normalize dtype/device and shape
         if device is None:
@@ -787,44 +785,44 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, seq_idx=None, device: Devic
 
         batch_size = x.shape[0]
         nchunks = A_cumsum_last.shape[-1]
-        
+
         # Support both (seqlen,) and (batch, seqlen) seq_idx shapes
         if seq_idx.ndim == 1:
-            # Single seq_idx applies to all batches
             seq_idx = seq_idx.unsqueeze(0).expand(batch_size, -1)
-        
-        # seq_idx shape: (batch, seqlen) containing global position indices
-        # Reshape to identify chunk boundaries per batch
+
+        # seq_idx shape: (batch, seqlen) -> reshape into chunks: (batch, nchunks, chunk_size)
         seq_idx_chunks = rearrange(seq_idx, "b (c l) -> b c l", l=chunk_size)
-        
-        # Get the first and last position index of each chunk for each batch
-        chunk_start_idx = seq_idx_chunks[:, :, 0]  # (batch, nchunks)
-        chunk_end_idx = seq_idx_chunks[:, :, -1]  # (batch, nchunks)
-        
-        # Check if consecutive chunks are contiguous per batch:
-        # chunk i and chunk i+1 are contiguous if end_idx[i] + 1 == start_idx[i+1]
-        # is_boundary_break[b, i] = True means there's a break between chunk i-1 and chunk i in batch b
-        is_boundary_break = torch.zeros(batch_size, nchunks + 1, dtype=torch.bool, device=device)
+        chunk_start_idx = seq_idx_chunks[:, :, 0]   # (batch, nchunks)
+        chunk_end_idx = seq_idx_chunks[:, :, -1]    # (batch, nchunks)
+
         if nchunks > 1:
-            # Check each consecutive pair for each batch
-            is_boundary_break[:, 1:nchunks] = (chunk_end_idx[:, :-1] + 1) != chunk_start_idx[:, 1:]
-        
-        # Apply masking to decay_chunk
-        # decay_chunk[b, h, i, j] represents the decay from states[j] to new_states[i]
-        # states has shape (batch, nchunks+1, ...) where states[0] is initial state
-        # states[1] corresponds to data chunk 0, states[2] to data chunk 1, etc.
-        #
-        # If there's a break between data chunk k-1 and k, then:
-        # - In states array: break between states[k] and states[k+1]
-        # - We need to zero decay_chunk[:, :, k+1:, :k+1] to prevent all propagation
-        #   from chunks before the break to chunks at/after the break
-        for b in range(batch_size):
-            for i in range(1, nchunks + 1):
-                if is_boundary_break[b, i]:
-                    # i is the data chunk index (0-indexed) where break occurs
-                    # In states array, this is index i (since states[0] is initial)
-                    # Zero propagation from all chunks before break (states[0:i+1]) to chunks at/after break (new_states[i+1:])
-                    decay_chunk[b, :, i+1:, :i+1] = 0
+            # is_break between chunk i-1 and i (for chunks indices 1..nchunks-1)
+            is_break_mid = (chunk_end_idx[:, :-1] + 1) != chunk_start_idx[:, 1:]  # (batch, nchunks-1)
+            # prepend a False so indices align with chunk/state positions when we build group ids
+            is_break = torch.cat([torch.zeros(batch_size, 1, dtype=torch.bool, device=device), is_break_mid], dim=1)  # (batch, nchunks)
+        else:
+            # no breaks possible when only 1 chunk
+            is_break = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
+
+        # We have nchunks data-chunks -> states array has nchunks+1 entries (state 0 = initial)
+        # Build `group_id` for states (length nchunks+1). We want same group id for chunks that are contiguous.
+        # For chunk k (0-based), its corresponding state index is k+1; state index 0 is initial state.
+        # Build `breaks_for_states` of length nchunks+1 where breaks_for_states[0]=0 and breaks_for_states[1:] = is_break
+        breaks_for_states = torch.cat([torch.zeros(batch_size, 1, dtype=torch.long, device=device),
+                                       is_break.to(torch.long)], dim=1)  # (batch, nchunks+1)
+        # group id: cumulative sum of breaks -> equal group id means contiguous
+        group_id = torch.cumsum(breaks_for_states, dim=1)  # (batch, nchunks+1)
+
+        # Now allow propagation only between positions with the same group id
+        # mask_states[b, i, j] == True iff group_id[b,i] == group_id[b,j]
+        mask_states = group_id.unsqueeze(2) == group_id.unsqueeze(1)  # (batch, nchunks+1, nchunks+1)
+
+        # broadcast to match decay_chunk shape: (batch, nheads, nchunks+1, nchunks+1)
+        mask_states = mask_states.unsqueeze(1)  # (batch, 1, nchunks+1, nchunks+1)
+
+        # Apply mask: zero out decay_chunk where mask is False
+        decay_chunk = decay_chunk * mask_states
+
 
     new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]
