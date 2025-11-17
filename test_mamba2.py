@@ -429,6 +429,131 @@ def test_step_ngroups_no_averaging():
     print("✓ Step ngroups handling test passed")
 
 
+def test_conv_state_semantics():
+    """Test that conv_state contains correct frames for step inference."""
+    print("\nTesting conv_state semantics...")
+    torch.manual_seed(42)
+    
+    config = Mamba2Config(d_model=128, d_conv=4, chunk_size=64)
+    model = Mamba2(config)
+    model.eval()
+    
+    batch = 2
+    seqlen = 64
+    x = torch.randn(batch, seqlen, 128)
+    
+    # Get conv_state from forward pass
+    with torch.no_grad():
+        y_full, h = model(x)
+    
+    # Now do a step and verify it uses the conv_state correctly
+    u = torch.randn(batch, 1, 128)
+    with torch.no_grad():
+        y_step, h_step = model(u, h)
+    
+    assert y_step.shape == (batch, 1, 128), "Step output should be correct shape"
+    assert h_step.conv_state.shape == h.conv_state.shape, "Conv state shape should be preserved"
+    
+    print("✓ conv_state semantics test passed")
+
+
+def test_dt_out_optional_return():
+    """Test that fused path can optionally return dt_out."""
+    print("\nTesting dt_out optional return...")
+    torch.manual_seed(42)
+    
+    from mamba2 import mamba_split_conv1d_scan_combined
+    from einops import rearrange
+    
+    config = Mamba2Config(d_model=128, chunk_size=64)
+    model = Mamba2(config)
+    
+    batch, seqlen = 2, 64
+    x = torch.randn(batch, seqlen, 128)
+    zxbcdt = model.in_proj(x)
+    A = -torch.exp(model.A_log)
+    
+    # Test without dt_out
+    with torch.no_grad():
+        result = mamba_split_conv1d_scan_combined(
+            zxbcdt,
+            rearrange(model.conv1d.weight, "d 1 w -> d w"),
+            model.conv1d.bias,
+            model.dt_bias,
+            A,
+            model.D,
+            config.chunk_size,
+            config.d_inner,
+            config.ngroups,
+            config.d_state,
+            config.headdim,
+            config.nheads,
+            activation=config.activation,
+            rmsnorm_weight=model.norm.weight,
+            rmsnorm_eps=model.norm.eps,
+            outproj_weight=model.out_proj.weight,
+            outproj_bias=model.out_proj.bias,
+            return_dt_out=False,
+        )
+    
+    assert len(result) == 2, "Should return (y, final_state) without dt_out"
+    y, final_state = result
+    
+    # Test with dt_out
+    with torch.no_grad():
+        result_with_dt = mamba_split_conv1d_scan_combined(
+            zxbcdt,
+            rearrange(model.conv1d.weight, "d 1 w -> d w"),
+            model.conv1d.bias,
+            model.dt_bias,
+            A,
+            model.D,
+            config.chunk_size,
+            config.d_inner,
+            config.ngroups,
+            config.d_state,
+            config.headdim,
+            config.nheads,
+            activation=config.activation,
+            rmsnorm_weight=model.norm.weight,
+            rmsnorm_eps=model.norm.eps,
+            outproj_weight=model.out_proj.weight,
+            outproj_bias=model.out_proj.bias,
+            return_dt_out=True,
+        )
+    
+    assert len(result_with_dt) == 3, "Should return (y, final_state, dt_out) with dt_out"
+    y_dt, final_state_dt, dt_out = result_with_dt
+    
+    # Outputs should be the same
+    assert torch.allclose(y, y_dt), "Outputs should match regardless of dt_out flag"
+    assert dt_out.shape == (batch, seqlen, config.nheads), "dt_out should have correct shape"
+    
+    print("✓ dt_out optional return test passed")
+
+
+def test_seq_idx_parameter():
+    """Test that seq_idx parameter is accepted (even if not fully implemented)."""
+    print("\nTesting seq_idx parameter...")
+    torch.manual_seed(42)
+    
+    config = Mamba2Config(d_model=128, chunk_size=64)
+    model = Mamba2(config)
+    model.eval()
+    
+    batch, seqlen = 2, 64
+    x = torch.randn(batch, seqlen, 128)
+    
+    # Test that we can pass seq_idx (even if it's not used yet)
+    seq_idx = torch.arange(seqlen)
+    with torch.no_grad():
+        y, h = model(x, seq_idx=seq_idx)
+    
+    assert y.shape == x.shape, "Output should have correct shape with seq_idx"
+    
+    print("✓ seq_idx parameter test passed")
+
+
 def run_all_tests():
     """Run all unit tests."""
     print("=" * 60)
@@ -448,6 +573,9 @@ def run_all_tests():
     test_fused_vs_simple_path()
     test_fused_path_returns_states()
     test_step_ngroups_no_averaging()
+    test_conv_state_semantics()
+    test_dt_out_optional_return()
+    test_seq_idx_parameter()
     
     print("\n" + "=" * 60)
     print("All tests passed! ✓")

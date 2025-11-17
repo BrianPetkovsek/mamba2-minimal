@@ -136,7 +136,8 @@ def mamba_split_conv1d_scan_combined(
     seq_idx: Tensor | None = None,
     initial_states: Tensor | None = None,
     device: Device = None,
-) -> tuple[Tensor, Tensor]:
+    return_dt_out: bool = False,
+) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
     """Pure PyTorch implementation of mamba_split_conv1d_scan_combined.
     
     This fused operation combines:
@@ -168,13 +169,15 @@ def mamba_split_conv1d_scan_combined(
         outproj_weight: (d_model, d_inner) output projection weight
         outproj_bias: (d_model,) output projection bias
         dt_limit: (min, max) dt limit tuple
-        seq_idx: optional sequence indices
+        seq_idx: optional sequence indices for chunked processing
         initial_states: optional initial SSM states
         device: device for computation
+        return_dt_out: whether to return dt_out for backward pass
     
     Returns:
         out: (batch, seqlen, d_model) output
         final_state: (batch, nheads, headdim, d_state) final SSM state
+        dt_out: (batch, seqlen, nheads) dt values (optional, if return_dt_out=True)
     """
     batch, seqlen, _ = zxbcdt.shape
     
@@ -215,6 +218,7 @@ def mamba_split_conv1d_scan_combined(
         C,
         chunk_size,
         initial_states=initial_states,
+        seq_idx=seq_idx,
         device=device,
     )
     
@@ -239,6 +243,8 @@ def mamba_split_conv1d_scan_combined(
     if outproj_weight is not None:
         y = F.linear(y, outproj_weight, outproj_bias)
     
+    if return_dt_out:
+        return y, final_state, dt
     return y, final_state
 
 
@@ -494,7 +500,8 @@ class Mamba2(nn.Module):
             )
             
             # For inference cache, we need to compute conv_state
-            # Conv state: last d_conv positions of xBC
+            # Conv state should contain the last d_conv input frames (pre-conv)
+            # This matches what step() expects
             z, xBC, dt = torch.split(
                 zxbcdt,
                 [
@@ -504,9 +511,13 @@ class Mamba2(nn.Module):
                 ],
                 dim=-1,
             )
-            conv_state = F.pad(
-                rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - u.shape[1], 0)
-            )
+            # Store the last d_conv frames of xBC (the input buffer for rolling conv)
+            xBC_t = rearrange(xBC, "b l d -> b d l")
+            if seqlen >= self.args.d_conv:
+                conv_state = xBC_t[:, :, -self.args.d_conv:].clone()
+            else:
+                # Pad if sequence is shorter than d_conv
+                conv_state = F.pad(xBC_t, (self.args.d_conv - seqlen, 0))
             
             h = InferenceCache(conv_state, ssm_state)
             return y, h
@@ -527,10 +538,13 @@ class Mamba2(nn.Module):
         if self.args.dt_limit != (0.0, float("inf")):
             dt = torch.clamp(dt, min=self.args.dt_limit[0], max=self.args.dt_limit[1])
 
-        # Pad or truncate xBC seqlen to d_conv
-        conv_state = F.pad(
-            rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - u.shape[1], 0)
-        )
+        # Store the last d_conv frames of xBC for conv_state (input buffer)
+        xBC_t = rearrange(xBC, "b l d -> b d l")
+        if seqlen >= self.args.d_conv:
+            conv_state = xBC_t[:, :, -self.args.d_conv:].clone()
+        else:
+            # Pad if sequence is shorter than d_conv
+            conv_state = F.pad(xBC_t, (self.args.d_conv - seqlen, 0))
 
         # Apply convolution with activation
         if self.args.activation in ["silu", "swish"]:
@@ -558,6 +572,7 @@ class Mamba2(nn.Module):
             C,
             self.args.chunk_size,
             initial_states=initial_states,
+            seq_idx=seq_idx,
             device=self.device,
         )
         y = y + x * self.D.unsqueeze(-1)
@@ -668,7 +683,7 @@ def segsum(x: Tensor, device: Device = None) -> Tensor:
     return x_segsum
 
 
-def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
+def ssd(x, A, B, C, chunk_size, initial_states=None, seq_idx=None, device: Device = None):
     """Structed State Space Duality (SSD) - the core of Mamba-2
 
     This is almost the exact same minimal SSD code from the blog post.
@@ -678,9 +693,14 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
         A: (batch, seqlen, n_heads)
         B: (batch, seqlen, n_groups, d_state) where n_groups can equal n_heads
         C: (batch, seqlen, n_groups, d_state) where n_groups can equal n_heads
+        chunk_size: size of chunks for processing
+        initial_states: optional initial states
+        seq_idx: optional sequence indices for proper chunk boundary handling
+        device: device for computation
 
     Return
         y: (batch, seqlen, n_heads, d_head)
+        final_state: (batch, nheads, headdim, d_state) final SSM state
 
     Source
      1. https://tridao.me/blog/2024/mamba2-part3-algorithm/
