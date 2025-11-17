@@ -137,7 +137,8 @@ def mamba_split_conv1d_scan_combined(
     initial_states: Tensor | None = None,
     device: Device = None,
     return_dt_out: bool = False,
-) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
+    return_dA_cumsum: bool = False,
+) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
     """Pure PyTorch implementation of mamba_split_conv1d_scan_combined.
     
     This fused operation combines:
@@ -178,6 +179,7 @@ def mamba_split_conv1d_scan_combined(
         out: (batch, seqlen, d_model) output
         final_state: (batch, nheads, headdim, d_state) final SSM state
         dt_out: (batch, seqlen, nheads) dt values (optional, if return_dt_out=True)
+        dA_cumsum: cumulative A values for backward (optional, if return_dA_cumsum=True)
     """
     batch, seqlen, _ = zxbcdt.shape
     
@@ -243,8 +245,25 @@ def mamba_split_conv1d_scan_combined(
     if outproj_weight is not None:
         y = F.linear(y, outproj_weight, outproj_bias)
     
-    if return_dt_out:
+    # Compute dA_cumsum if requested (for backward pass)
+    # This is A * dt accumulated over the sequence
+    dA_cumsum = None
+    if return_dA_cumsum:
+        # A * dt was already computed for the SSD call
+        A_dt = A * dt
+        # Reshape to chunks and compute cumsum
+        A_dt_chunked = rearrange(A_dt, "b (c l) h -> b h c l", l=chunk_size)
+        dA_cumsum = torch.cumsum(A_dt_chunked, dim=-1)
+        # Get the last value of each chunk
+        dA_cumsum = dA_cumsum[:, :, :, -1]  # (batch, nheads, nchunks)
+    
+    # Return based on what's requested
+    if return_dt_out and return_dA_cumsum:
+        return y, final_state, dt, dA_cumsum
+    elif return_dt_out:
         return y, final_state, dt
+    elif return_dA_cumsum:
+        return y, final_state, dA_cumsum
     return y, final_state
 
 
@@ -742,7 +761,47 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, seq_idx=None, device: Devic
     if initial_states is None:
         initial_states = torch.zeros_like(states[:, :1])
     states = torch.cat([initial_states, states], dim=1)
-    decay_chunk = torch.exp(segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0)), device=device))
+    
+    # Compute A_cumsum at chunk boundaries for inter-chunk decay
+    A_cumsum_last = A_cumsum[:, :, :, -1]  # (batch, nheads, nchunks)
+    
+    # Handle seq_idx for proper chunk boundary behavior
+    # seq_idx indicates global sequence positions; when chunks are non-contiguous,
+    # we need to reset the SSM state propagation
+    if seq_idx is not None:
+        # seq_idx shape: (seqlen,) containing global position indices
+        # Reshape to identify chunk boundaries
+        seq_idx_chunks = rearrange(seq_idx, "(c l) -> c l", l=chunk_size)
+        # Get the last position of each chunk and first position of next chunk
+        last_positions = seq_idx_chunks[:, -1]  # (nchunks,)
+        first_positions = seq_idx_chunks[:, 0]  # (nchunks,)
+        
+        # Check continuity: chunk i and i+1 are contiguous if last_pos[i] + 1 == first_pos[i+1]
+        # Shift first_positions to align with prev chunk's last position
+        is_contiguous = torch.ones(A_cumsum_last.shape[-1] + 1, dtype=torch.bool, device=device)
+        if len(last_positions) > 1:
+            # Compare last of chunk i with first of chunk i+1
+            is_contiguous[1:-1] = (last_positions[:-1] + 1) == first_positions[1:]
+        # is_contiguous[0] is for initial state (always keep)
+        # is_contiguous[i] tells if we should propagate from chunk i-1 to chunk i
+        
+        # Create a mask to zero out non-contiguous transitions
+        # We'll apply this after computing decay_chunk
+        contiguity_mask = is_contiguous.float()  # (nchunks+1,)
+        # Expand to match decay_chunk dimensions: (batch, nheads, nchunks+1, nchunks+1)
+        contiguity_mask = contiguity_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1)
+    
+    # Compute decay for inter-chunk recurrence using segsum
+    # Pad A_cumsum_last with 0 at the beginning for initial state
+    decay_chunk = torch.exp(segsum(F.pad(A_cumsum_last, (1, 0)), device=device))
+    # decay_chunk shape: (batch, nheads, nchunks+1, nchunks+1)
+    
+    # Apply seq_idx mask if provided
+    if seq_idx is not None:
+        # Zero out transitions from non-contiguous chunks
+        # The mask should be applied to the "source" dimension of decay_chunk
+        decay_chunk = decay_chunk * contiguity_mask
+    
     new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]
 
