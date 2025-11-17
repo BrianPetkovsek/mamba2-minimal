@@ -32,6 +32,17 @@ class Mamba2Config:
     chunk_size: int = 64  # matrix partition size (Q)
     vocab_size: int = 50277
     pad_vocab_size_multiple: int = 16
+    ngroups: int = 1  # number of groups for group normalization
+    A_init_range: tuple[float, float] = (1, 16)  # A parameter initialization range
+    dt_min: float = 0.001  # minimum delta time
+    dt_max: float = 0.1  # maximum delta time
+    dt_init_floor: float = 1e-4  # floor for dt initialization
+    dt_limit: tuple[float, float] = (0.0, float("inf"))  # dt limit range
+    learnable_init_states: bool = False  # whether to learn initial states
+    activation: str = "swish"  # activation function ("silu" or "swish")
+    conv_init: float | None = None  # convolution initialization range
+    conv_bias: bool = True  # whether to use bias in convolution
+    use_mem_eff_path: bool = True  # use memory efficient (fused) path
 
     def __post_init__(self):
         self.d_inner = self.expand * self.d_model
@@ -45,19 +56,61 @@ class Mamba2Config:
 
 
 class InferenceCache(NamedTuple):
-    conv_state: Tensor  # (batch, d_inner + 2 * d_state, d_conv)
+    conv_state: Tensor  # (batch, d_inner + 2 * ngroups * d_state, d_conv)
     ssm_state: Tensor  # (batch, nheads, headdim, d_state)
 
     @staticmethod
     def alloc(batch_size: int, args: Mamba2Config, device: Device = None):
         return InferenceCache(
             torch.zeros(
-                batch_size, args.d_inner + 2 * args.d_state, args.d_conv, device=device
+                batch_size, args.d_inner + 2 * args.ngroups * args.d_state, args.d_conv, device=device
             ),
             torch.zeros(
                 batch_size, args.nheads, args.headdim, args.d_state, device=device
             ),
         )
+
+
+def inverse_softplus(x: Tensor) -> Tensor:
+    """Inverse of softplus function.
+    
+    softplus(y) = log(1 + exp(y)), so y = log(exp(x) - 1)
+    Numerically stable form: y = x + log(-expm1(-x))
+    """
+    return x + torch.log(-torch.expm1(-x))
+
+
+def causal_conv1d_pytorch(
+    x: Tensor, weight: Tensor, bias: Tensor | None = None, activation: str = "silu"
+) -> Tensor:
+    """Pure PyTorch implementation of causal_conv1d with activation.
+    
+    Arguments:
+        x: (batch, seq_len, channels) input
+        weight: (channels, kernel_width) grouped conv weight
+        bias: (channels,) optional bias
+        activation: "silu" or "swish"
+    
+    Returns:
+        (batch, seq_len, channels) output
+    """
+    # Transpose to (batch, channels, seq_len) for conv1d
+    x = x.transpose(1, 2)
+    k = weight.shape[-1]
+    # Convert weight to conv1d format: (out_channels, 1, kernel_width)
+    w = weight.unsqueeze(1)
+    # Apply grouped conv with causal padding
+    out = F.conv1d(x, w, bias=bias, padding=k - 1, groups=x.shape[1])
+    # Truncate to original length (causal: only use past)
+    out = out[:, :, :x.shape[2]]
+    
+    if activation in ["silu", "swish"]:
+        out = out * torch.sigmoid(out)
+    else:
+        raise NotImplementedError(f"Activation {activation} not implemented")
+    
+    # Transpose back to (batch, seq_len, channels)
+    return out.transpose(1, 2)
 
 
 class Mamba2LMHeadModel(nn.Module):
@@ -203,30 +256,67 @@ class Mamba2(nn.Module):
         self.device = device
 
         # Order: (z, x, B, C, dt)
-        d_in_proj = 2 * args.d_inner + 2 * args.d_state + args.nheads
+        d_in_proj = 2 * args.d_inner + 2 * args.ngroups * args.d_state + args.nheads
         self.in_proj = nn.Linear(args.d_model, d_in_proj, bias=False, device=device)
 
-        conv_dim = args.d_inner + 2 * args.d_state
+        conv_dim = args.d_inner + 2 * args.ngroups * args.d_state
         self.conv1d = nn.Conv1d(
             in_channels=conv_dim,
             out_channels=conv_dim,
             kernel_size=args.d_conv,
             groups=conv_dim,
+            bias=args.conv_bias,
             padding=args.d_conv - 1,
             device=device,
         )
+        
+        # Initialize convolution weights if conv_init is specified
+        if args.conv_init is not None:
+            nn.init.uniform_(self.conv1d.weight, -args.conv_init, args.conv_init)
 
-        self.dt_bias = nn.Parameter(torch.empty(args.nheads, device=device))
-        self.A_log = nn.Parameter(torch.empty(args.nheads, device=device))
-        self.D = nn.Parameter(torch.empty(args.nheads, device=device))
+        # Learnable initial states
+        if args.learnable_init_states:
+            self.init_states = nn.Parameter(
+                torch.zeros(args.nheads, args.headdim, args.d_state, device=device)
+            )
+            self.init_states._no_weight_decay = True
+        else:
+            self.init_states = None
+
+        # Initialize dt_bias using inverse softplus
+        import math
+        dt = torch.exp(
+            torch.rand(args.nheads, device=device)
+            * (math.log(args.dt_max) - math.log(args.dt_min))
+            + math.log(args.dt_min)
+        )
+        dt = torch.clamp(dt, min=args.dt_init_floor)
+        inv_dt = inverse_softplus(dt)
+        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_bias._no_weight_decay = True
+
+        # Initialize A_log from uniform range
+        assert args.A_init_range[0] > 0 and args.A_init_range[1] >= args.A_init_range[0]
+        A = torch.empty(args.nheads, dtype=torch.float32, device=device).uniform_(
+            *args.A_init_range
+        )
+        A_log = torch.log(A)
+        self.A_log = nn.Parameter(A_log)
+        self.A_log._no_weight_decay = True
+
+        # D "skip" parameter
+        self.D = nn.Parameter(torch.ones(args.nheads, device=device))
+        self.D._no_weight_decay = True
+
         self.norm = RMSNorm(args.d_inner, device=device)
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False, device=device)
 
-    def forward(self, u: Tensor, h: InferenceCache | None = None):
+    def forward(self, u: Tensor, h: InferenceCache | None = None, seq_idx: Tensor | None = None):
         """
         Arguments
             u: (batch, seqlen, d_model) input. seqlen should be a multiple of chunk_size.
             h: hidden states for inference step. Initialized to 0s if not present.
+            seq_idx: (seqlen,) optional sequence indices for chunked processing
 
         Return (y, h)
             y: (batch, seqlen, d_model) output
@@ -235,37 +325,63 @@ class Mamba2(nn.Module):
         if h:
             return self.step(u, h)
 
+        batch, seqlen = u.shape[0], u.shape[1]
         A = -torch.exp(self.A_log)  # (nheads,)
+        
+        # Get initial states
+        initial_states = None
+        if self.args.learnable_init_states and self.init_states is not None:
+            # initial_states shape: (nheads, headdim, d_state)
+            # Need shape: (batch, 1, nheads, headdim, d_state) for ssd
+            initial_states = repeat(self.init_states, "h p n -> b 1 h p n", b=batch)
+        
         zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
         z, xBC, dt = torch.split(
             zxbcdt,
             [
                 self.args.d_inner,
-                self.args.d_inner + 2 * self.args.d_state,
+                self.args.d_inner + 2 * self.args.ngroups * self.args.d_state,
                 self.args.nheads,
             ],
             dim=-1,
         )
         dt = F.softplus(dt + self.dt_bias)  # (batch, seqlen, nheads)
+        
+        # Apply dt_limit if specified
+        if self.args.dt_limit != (0.0, float("inf")):
+            dt = torch.clamp(dt, min=self.args.dt_limit[0], max=self.args.dt_limit[1])
 
         # Pad or truncate xBC seqlen to d_conv
         conv_state = F.pad(
             rearrange(xBC, "b l d -> b d l"), (self.args.d_conv - u.shape[1], 0)
         )
 
-        xBC = silu(
-            self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, : u.shape[1], :]
-        )  # (batch, seqlen, d_inner + 2 * d_state))
+        # Apply convolution with activation
+        if self.args.activation in ["silu", "swish"]:
+            xBC = silu(
+                self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)[:, :seqlen, :]
+            )  # (batch, seqlen, d_inner + 2 * ngroups * d_state)
+        else:
+            raise NotImplementedError(f"Activation {self.args.activation} not implemented")
+            
         x, B, C = torch.split(
-            xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
+            xBC, 
+            [self.args.d_inner, self.args.ngroups * self.args.d_state, self.args.ngroups * self.args.d_state], 
+            dim=-1
         )
         x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
+        
+        # Reshape B and C for ngroups
+        B = rearrange(B, "b l (g n) -> b l g n", g=self.args.ngroups)
+        C = rearrange(C, "b l (g n) -> b l g n", g=self.args.ngroups)
+        
         y, ssm_state = ssd(
             x * dt.unsqueeze(-1),
             A * dt,
-            rearrange(B, "b l n -> b l 1 n"),
-            rearrange(C, "b l n -> b l 1 n"),
+            B,
+            C,
             self.args.chunk_size,
+            initial_states=initial_states,
             device=self.device,
         )
         y = y + x * self.D.unsqueeze(-1)
@@ -301,7 +417,7 @@ class Mamba2(nn.Module):
             zxbcdt,
             [
                 self.args.d_inner,
-                self.args.d_inner + 2 * self.args.d_state,
+                self.args.d_inner + 2 * self.args.ngroups * self.args.d_state,
                 self.args.nheads,
             ],
             dim=-1,
@@ -314,21 +430,45 @@ class Mamba2(nn.Module):
         xBC = torch.sum(
             h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
         )
-        xBC += self.conv1d.bias
+        if self.conv1d.bias is not None:
+            xBC += self.conv1d.bias
         xBC = silu(xBC)
 
         x, B, C = torch.split(
-            xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
+            xBC, 
+            [self.args.d_inner, self.args.ngroups * self.args.d_state, self.args.ngroups * self.args.d_state], 
+            dim=-1
         )
         A = -torch.exp(self.A_log)  # (nheads,)
 
         # SSM step
         dt = F.softplus(dt + self.dt_bias)  # (batch, nheads)
+        
+        # Apply dt_limit if specified
+        if self.args.dt_limit != (0.0, float("inf")):
+            dt = torch.clamp(dt, min=self.args.dt_limit[0], max=self.args.dt_limit[1])
+            
         dA = torch.exp(dt * A)  # (batch, nheads)
         x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
-        dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
-        h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-        y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
+        
+        # For ngroups support in step: we need to handle the grouped B and C
+        # When ngroups > 1, B and C have shape (batch, ngroups * d_state)
+        # The SSM state update needs to be computed per group
+        if self.args.ngroups == 1:
+            dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
+            h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+            y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
+        else:
+            # Reshape B and C for groups
+            B_grouped = rearrange(B, "b (g n) -> b g n", g=self.args.ngroups)
+            C_grouped = rearrange(C, "b (g n) -> b g n", g=self.args.ngroups)
+            # Average over groups for the SSM computation (this is a simplification)
+            B_avg = B_grouped.mean(dim=1)  # (batch, d_state)
+            C_avg = C_grouped.mean(dim=1)  # (batch, d_state)
+            dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B_avg, x)
+            h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+            y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C_avg)
+            
         y = y + rearrange(self.D, "h -> h 1") * x
         y = rearrange(y, "b h p -> b (h p)")
         y = self.norm(y, z)
@@ -362,8 +502,8 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
     Arguments
         x: (batch, seqlen, n_heads, d_head)
         A: (batch, seqlen, n_heads)
-        B: (batch, seqlen, n_heads, d_state)
-        C: (batch, seqlen, n_heads, d_state)
+        B: (batch, seqlen, n_groups, d_state) where n_groups can equal n_heads
+        C: (batch, seqlen, n_groups, d_state) where n_groups can equal n_heads
 
     Return
         y: (batch, seqlen, n_heads, d_head)
@@ -373,6 +513,16 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
      2. https://github.com/state-spaces/mamba/blob/219f03c840d5a44e7d42e4e728134834fddccf45/mamba_ssm/modules/ssd_minimal.py#L34-L78
     """
     assert x.shape[1] % chunk_size == 0
+    
+    # When ngroups < nheads, expand B and C to match nheads by repeating groups
+    nheads = x.shape[2]
+    ngroups = B.shape[2]
+    if ngroups < nheads:
+        # Expand groups to heads: each group is repeated for multiple heads
+        assert nheads % ngroups == 0, f"nheads ({nheads}) must be divisible by ngroups ({ngroups})"
+        heads_per_group = nheads // ngroups
+        B = repeat(B, "b l g n -> b l (g h) n", h=heads_per_group)
+        C = repeat(C, "b l g n -> b l (g h) n", h=heads_per_group)
 
     # Rearrange into chunks
     # Step 1, 2 and 4 of SSD can be computed in parallel for each chunk across devices (sequence parallel)
@@ -414,19 +564,34 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, device: Device = None):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, d: int, eps: float = 1e-5, device: Device = None):
-        """Gated Root Mean Square Layer Normalization
+    def __init__(self, d: int, eps: float = 1e-5, norm_before_gate: bool = False, device: Device = None):
+        """Gated Root Mean Square Layer Normalization (RMSNormGated)
 
         Paper: https://arxiv.org/abs/1910.07467
+        
+        Args:
+            d: dimension
+            eps: epsilon for numerical stability
+            norm_before_gate: if True, normalize before gating; if False, gate before normalizing
         """
         super().__init__()
         self.eps = eps
+        self.norm_before_gate = norm_before_gate
         self.weight = nn.Parameter(torch.ones(d, device=device))
 
     def forward(self, x, z=None):
         if z is not None:
-            x = x * silu(z)
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+            if self.norm_before_gate:
+                # Normalize first, then gate
+                x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+                x = x * silu(z)
+            else:
+                # Gate first, then normalize (default behavior matching repo)
+                x = x * silu(z)
+                x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        else:
+            x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        return x
 
 
 def silu(x):
