@@ -329,6 +329,38 @@ def test_config_defaults():
     print("✓ Config defaults test passed")
 
 
+def test_fused_vs_simple_path():
+    """Test that fused and simple paths produce identical results."""
+    print("\nTesting fused vs simple path equivalence...")
+    torch.manual_seed(42)
+    
+    # Test with fused path
+    config_fused = Mamba2Config(d_model=256, use_mem_eff_path=True, ngroups=2)
+    model_fused = Mamba2(config_fused)
+    model_fused.eval()
+    
+    # Test with simple path
+    config_simple = Mamba2Config(d_model=256, use_mem_eff_path=False, ngroups=2)
+    model_simple = Mamba2(config_simple)
+    model_simple.eval()
+    
+    # Copy weights from fused to simple to ensure identical parameters
+    model_simple.load_state_dict(model_fused.state_dict())
+    
+    batch, seqlen = 2, 64
+    x = torch.randn(batch, seqlen, 256)
+    
+    with torch.no_grad():
+        y_fused, h_fused = model_fused(x)
+        y_simple, h_simple = model_simple(x)
+    
+    # Outputs should be identical
+    assert torch.allclose(y_fused, y_simple, rtol=1e-4, atol=1e-5), \
+        f"Fused and simple paths should match, max diff: {torch.abs(y_fused - y_simple).max()}"
+    
+    print("✓ Fused vs simple path test passed")
+
+
 def run_all_tests():
     """Run all unit tests."""
     print("=" * 60)
@@ -345,6 +377,7 @@ def run_all_tests():
     test_rmsnorm_gated()
     test_ssd_numerical()
     test_config_defaults()
+    test_fused_vs_simple_path()
     
     print("\n" + "=" * 60)
     print("All tests passed! ✓")
