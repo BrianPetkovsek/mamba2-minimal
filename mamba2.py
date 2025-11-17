@@ -356,7 +356,7 @@ class Mamba2LMHeadModel(nn.Module):
         input_ids: LongTensor,
         max_new_length: int = 20,
         temperature: float = 1.0,
-        top_k: float = 50,
+        top_k: int = 50,
         top_p: float = 1.0,
         eos_token_id: int = 0,
     ) -> Iterable[tuple[int, list[InferenceCache]]]:
@@ -476,7 +476,7 @@ class Mamba2(nn.Module):
             y: (batch, seqlen, d_model) output
             h: updated inference cache after processing `u`
         """
-        if h:
+        if h is not None:
             return self.step(u, h)
 
         batch, seqlen = u.shape[0], u.shape[1]
@@ -778,7 +778,7 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, seq_idx=None, device: Devic
     if seq_idx is not None and seq_idx.numel() > 0:
         # normalize dtype/device and shape
         if device is None:
-            device = A.device
+            device = x.device
         seq_idx = seq_idx.to(device=device)
         if seq_idx.dtype != torch.long:
             seq_idx = seq_idx.long()
