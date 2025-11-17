@@ -35,7 +35,7 @@ def test_causal_conv1d():
     print("\nTesting causal_conv1d_pytorch...")
     batch, seqlen, channels = 2, 16, 8
     kernel_width = 4
-    
+
     x = torch.randn(batch, seqlen, channels)
     weight = torch.randn(channels, kernel_width)
     bias = torch.randn(channels)
@@ -57,7 +57,7 @@ def test_causal_conv1d():
     # Output at position 5 and after should be different
     assert not torch.allclose(out[:, 5:, :], out_modified[:, 5:, :], rtol=1e-5, atol=1e-6), \
         "Output should change after modified position"
-    
+
     print("✓ causal_conv1d_pytorch test passed")
 
 
@@ -65,7 +65,7 @@ def test_parameter_initialization():
     """Test that parameter initialization matches expected distributions."""
     print("\nTesting parameter initialization...")
     torch.manual_seed(42)
-    
+
     config = Mamba2Config(
         d_model=256,
         ngroups=2,
@@ -97,7 +97,7 @@ def test_parameter_initialization():
     assert hasattr(model.A_log, '_no_weight_decay'), "A_log should have _no_weight_decay"
     assert hasattr(model.D, '_no_weight_decay'), "D should have _no_weight_decay"
     assert hasattr(model.init_states, '_no_weight_decay'), "init_states should have _no_weight_decay"
-    
+
     print("✓ Parameter initialization test passed")
 
 
@@ -105,11 +105,11 @@ def test_ngroups_support():
     """Test that ngroups parameter works correctly."""
     print("\nTesting ngroups support...")
     torch.manual_seed(42)
-    
+
     for ngroups in [1, 2, 4]:
         config = Mamba2Config(d_model=256, ngroups=ngroups, expand=2, headdim=64)
         model = Mamba2(config)
-        
+
         batch, seqlen = 2, 64
         x = torch.randn(batch, seqlen, config.d_model)
         
@@ -121,9 +121,9 @@ def test_ngroups_support():
         u = torch.randn(batch, 1, config.d_model)
         y_step, h_step = model(u, h)
         assert y_step.shape == u.shape, f"Step output shape mismatch for ngroups={ngroups}"
-        
+
         print(f"  ✓ ngroups={ngroups} passed")
-    
+
     print("✓ ngroups support test passed")
 
 
@@ -131,16 +131,15 @@ def test_forward_vs_inference_consistency():
     """Test that step-by-step inference produces consistent results."""
     print("\nTesting forward vs step-by-step inference...")
     torch.manual_seed(42)
-    
+
     config = Mamba2Config(d_model=128, chunk_size=64)
     model = Mamba2(config)
     model.eval()
-    
+
     batch = 1
-    prefix_len = 64  # Process as prefix
-    step_len = 5     # Then do step-by-step
-    
-    # Generate sequence
+    prefix_len = 64
+    step_len = 5
+
     full_seq = torch.randn(batch, prefix_len + step_len, config.d_model)
     
     # Method 1: Process everything at once (in chunks)
@@ -150,7 +149,7 @@ def test_forward_vs_inference_consistency():
         h = InferenceCache.alloc(batch, config)
         # First establish the state with prefix
         _, h = model(full_seq[:, :prefix_len, :])
-        
+
         outputs1 = []
         for i in range(step_len):
             y_step, h = model(full_seq[:, prefix_len + i:prefix_len + i + 1, :], h)
@@ -161,7 +160,7 @@ def test_forward_vs_inference_consistency():
         h2 = InferenceCache.alloc(batch, config)
         # Process prefix
         _, h2 = model(full_seq[:, :prefix_len, :])
-        
+
         outputs2 = []
         for i in range(step_len):
             y_step, h2 = model(full_seq[:, prefix_len + i:prefix_len + i + 1, :], h2)
@@ -171,7 +170,7 @@ def test_forward_vs_inference_consistency():
     for i in range(step_len):
         max_diff = torch.abs(outputs1[i] - outputs2[i]).max().item()
         assert max_diff < 1e-5, f"Step {i} mismatch: {max_diff}"
-    
+
     print("✓ Forward vs step-by-step inference consistency test passed")
 
 
@@ -179,31 +178,22 @@ def test_dt_limit():
     """Test that dt_limit properly constrains dt values."""
     print("\nTesting dt_limit...")
     torch.manual_seed(42)
-    
+
     dt_min_limit, dt_max_limit = 0.01, 0.05
     config = Mamba2Config(
         d_model=128,
         dt_limit=(dt_min_limit, dt_max_limit),
     )
     model = Mamba2(config)
-    
+
     batch, seqlen = 2, 64
     x = torch.randn(batch, seqlen, config.d_model)
-    
-    # Hook to capture dt values
-    dt_values = []
-    
-    def hook_fn(module, input, output):
-        # This would need to be added to the forward method to capture dt
-        pass
-    
+
     with torch.no_grad():
         y, h = model(x)
-    
-    # Note: We can't easily test this without modifying the forward method to return dt
-    # But we can at least verify the model runs with dt_limit set
+
     assert y.shape == x.shape, "Model should run with dt_limit set"
-    
+
     print("✓ dt_limit test passed")
 
 
@@ -222,16 +212,16 @@ def test_learnable_init_states():
     model2 = Mamba2(config2)
     assert model2.init_states is not None, "init_states should be initialized"
     assert isinstance(model2.init_states, torch.nn.Parameter), "init_states should be a Parameter"
-    
+
     batch, seqlen = 2, 64
     x = torch.randn(batch, seqlen, config2.d_model)
     
     # Forward pass should use initial states
     with torch.no_grad():
         y, h = model2(x)
-    
+
     assert y.shape == x.shape, "Output shape should match input"
-    
+
     print("✓ learnable_init_states test passed")
 
 
@@ -239,7 +229,7 @@ def test_rmsnorm_gated():
     """Test RMSNorm gated behavior."""
     print("\nTesting RMSNorm gated behavior...")
     from mamba2 import RMSNorm, silu
-    
+
     d = 128
     batch, seqlen = 2, 64
     
@@ -247,32 +237,20 @@ def test_rmsnorm_gated():
     norm = RMSNorm(d)
     x = torch.randn(batch, seqlen, d)
     y = norm(x, z=None)
-    
-    # Should just normalize
-    mean_squared = (y ** 2).mean(dim=-1)
-    # After normalization, mean square should be close to 1
-    expected = torch.ones_like(mean_squared)
-    # Note: The weight parameter affects this, so we check the structure
-    
-    # Test with gating (norm_before_gate=False, default)
+
     norm_default = RMSNorm(d, norm_before_gate=False)
     z = torch.randn(batch, seqlen, d)
     y_gated = norm_default(x, z)
-    
-    # Should gate first (x * silu(z)), then normalize
-    assert y_gated.shape == x.shape, "Output shape should match input"
-    
-    # Test with gating (norm_before_gate=True)
+
     norm_before = RMSNorm(d, norm_before_gate=True)
     y_norm_before = norm_before(x, z)
-    
     # Should normalize first, then gate
+
+    assert y_gated.shape == x.shape, "Output shape should match input"
     assert y_norm_before.shape == x.shape, "Output shape should match input"
-    
-    # The two gating orders should give different results
     assert not torch.allclose(y_gated, y_norm_before, rtol=1e-3), \
         "Different gating orders should produce different outputs"
-    
+
     print("✓ RMSNorm gated test passed")
 
 
@@ -280,41 +258,38 @@ def test_ssd_numerical():
     """Test SSD function with simple inputs."""
     print("\nTesting SSD numerical correctness...")
     torch.manual_seed(42)
-    
+
     batch, seqlen, nheads, headdim, d_state = 1, 32, 4, 16, 32
     chunk_size = 16
     ngroups = 2
-    
+
     x = torch.randn(batch, seqlen, nheads, headdim)
     A = torch.randn(batch, seqlen, nheads)
     B = torch.randn(batch, seqlen, ngroups, d_state)
     C = torch.randn(batch, seqlen, ngroups, d_state)
-    
+
     y, final_state = ssd(x, A, B, C, chunk_size)
-    
+
     assert y.shape == x.shape, f"Output shape mismatch: {y.shape} != {x.shape}"
     assert final_state.shape == (batch, nheads, headdim, d_state), \
         f"Final state shape mismatch: {final_state.shape}"
-    
-    # Test with initial_states
+
     initial_states = torch.randn(batch, 1, nheads, headdim, d_state)
     y2, final_state2 = ssd(x, A, B, C, chunk_size, initial_states=initial_states)
-    
+
     assert y2.shape == x.shape, "Output shape should match input"
-    
-    # Results should be different with different initial states
     assert not torch.allclose(y, y2, rtol=1e-3), \
         "Different initial states should produce different outputs"
-    
+
     print("✓ SSD numerical test passed")
 
 
 def test_config_defaults():
     """Test that config defaults match expected values."""
     print("\nTesting config defaults...")
-    
+
     config = Mamba2Config(d_model=768)
-    
+
     assert config.ngroups == 1, "Default ngroups should be 1"
     assert config.A_init_range == (1, 16), "Default A_init_range should be (1, 16)"
     assert config.dt_min == 0.001, "Default dt_min should be 0.001"
@@ -325,7 +300,7 @@ def test_config_defaults():
     assert config.activation == "swish", "Default activation should be swish"
     assert config.conv_bias == True, "Default conv_bias should be True"
     assert config.use_mem_eff_path == True, "Default use_mem_eff_path should be True"
-    
+
     print("✓ Config defaults test passed")
 
 
@@ -346,10 +321,10 @@ def test_fused_vs_simple_path():
     
     # Copy weights from fused to simple to ensure identical parameters
     model_simple.load_state_dict(model_fused.state_dict())
-    
+
     batch, seqlen = 2, 64
     x = torch.randn(batch, seqlen, 256)
-    
+
     with torch.no_grad():
         y_fused, h_fused = model_fused(x)
         y_simple, h_simple = model_simple(x)
@@ -361,7 +336,7 @@ def test_fused_vs_simple_path():
     # SSM states should also be close (not zeros from fused path)
     assert not torch.allclose(h_fused.ssm_state, torch.zeros_like(h_fused.ssm_state)), \
         "Fused path should return non-zero SSM states"
-    
+
     print("✓ Fused vs simple path test passed")
 
 
@@ -369,14 +344,14 @@ def test_fused_path_returns_states():
     """Test that fused path returns proper SSM final states."""
     print("\nTesting fused path returns proper SSM states...")
     torch.manual_seed(42)
-    
+
     config = Mamba2Config(d_model=128, use_mem_eff_path=True, ngroups=2, chunk_size=64)
     model = Mamba2(config)
     model.eval()
-    
+
     batch, seqlen = 2, 64
     x = torch.randn(batch, seqlen, 128)
-    
+
     with torch.no_grad():
         y, h = model(x)
     
@@ -391,13 +366,13 @@ def test_fused_path_returns_states():
     u = torch.randn(batch, 1, 128)
     with torch.no_grad():
         y_step, h_step = model(u, h)
-    
+
     assert y_step.shape == (batch, 1, 128), "Step output shape should be correct"
     # Note: h_step.ssm_state is the same object as h.ssm_state (modified in place by copy_)
     # So we compare against the cloned before state
     assert not torch.allclose(h_step.ssm_state, h_ssm_before, rtol=1e-5, atol=1e-6), \
         "SSM state should be updated after step"
-    
+
     print("✓ Fused path returns proper SSM states test passed")
 
 
@@ -410,9 +385,9 @@ def test_step_ngroups_no_averaging():
     config = Mamba2Config(d_model=128, ngroups=2, chunk_size=64)
     model = Mamba2(config)
     model.eval()
-    
+
     from mamba2 import InferenceCache
-    
+
     batch = 2
     h = InferenceCache.alloc(batch, config)
     
@@ -421,11 +396,10 @@ def test_step_ngroups_no_averaging():
         u = torch.randn(batch, 1, 128)
         with torch.no_grad():
             y, h = model(u, h)
-        
-        # Check that SSM state is being updated
+
         assert not torch.allclose(h.ssm_state, torch.zeros_like(h.ssm_state)), \
             f"SSM state should be non-zero after step {i+1}"
-    
+
     print("✓ Step ngroups handling test passed")
 
 
@@ -433,11 +407,11 @@ def test_conv_state_semantics():
     """Test that conv_state contains correct frames for step inference."""
     print("\nTesting conv_state semantics...")
     torch.manual_seed(42)
-    
+
     config = Mamba2Config(d_model=128, d_conv=4, chunk_size=64)
     model = Mamba2(config)
     model.eval()
-    
+
     batch = 2
     seqlen = 64
     x = torch.randn(batch, seqlen, 128)
@@ -450,10 +424,10 @@ def test_conv_state_semantics():
     u = torch.randn(batch, 1, 128)
     with torch.no_grad():
         y_step, h_step = model(u, h)
-    
+
     assert y_step.shape == (batch, 1, 128), "Step output should be correct shape"
     assert h_step.conv_state.shape == h.conv_state.shape, "Conv state shape should be preserved"
-    
+
     print("✓ conv_state semantics test passed")
 
 
@@ -461,13 +435,13 @@ def test_dt_out_optional_return():
     """Test that fused path can optionally return dt_out."""
     print("\nTesting dt_out optional return...")
     torch.manual_seed(42)
-    
+
     from mamba2 import mamba_split_conv1d_scan_combined
     from einops import rearrange
-    
+
     config = Mamba2Config(d_model=128, chunk_size=64)
     model = Mamba2(config)
-    
+
     batch, seqlen = 2, 64
     x = torch.randn(batch, seqlen, 128)
     zxbcdt = model.in_proj(x)
@@ -495,7 +469,7 @@ def test_dt_out_optional_return():
             outproj_bias=model.out_proj.bias,
             return_dt_out=False,
         )
-    
+
     assert len(result) == 2, "Should return (y, final_state) without dt_out"
     y, final_state = result
     
@@ -521,14 +495,14 @@ def test_dt_out_optional_return():
             outproj_bias=model.out_proj.bias,
             return_dt_out=True,
         )
-    
+
     assert len(result_with_dt) == 3, "Should return (y, final_state, dt_out) with dt_out"
     y_dt, final_state_dt, dt_out = result_with_dt
     
     # Outputs should be the same
     assert torch.allclose(y, y_dt), "Outputs should match regardless of dt_out flag"
     assert dt_out.shape == (batch, seqlen, config.nheads), "dt_out should have correct shape"
-    
+
     print("✓ dt_out optional return test passed")
 
 
@@ -536,11 +510,11 @@ def test_seq_idx_parameter():
     """Test that seq_idx parameter is accepted and affects computation."""
     print("\nTesting seq_idx parameter...")
     torch.manual_seed(42)
-    
+
     config = Mamba2Config(d_model=128, chunk_size=32)
     model = Mamba2(config)
     model.eval()
-    
+
     batch, seqlen = 2, 64
     x = torch.randn(batch, seqlen, 128)
     
@@ -548,7 +522,7 @@ def test_seq_idx_parameter():
     seq_idx_contiguous = torch.arange(seqlen)
     with torch.no_grad():
         y_contiguous, h_contiguous = model(x, seq_idx=seq_idx_contiguous)
-    
+
     assert y_contiguous.shape == x.shape, "Output should have correct shape with seq_idx"
     
     # Test with non-contiguous seq_idx (chunks have gaps)
@@ -558,10 +532,10 @@ def test_seq_idx_parameter():
         torch.arange(32),
         torch.arange(100, 132)
     ])
-    
+
     with torch.no_grad():
         y_noncontiguous, h_noncontiguous = model(x, seq_idx=seq_idx_noncontiguous)
-    
+
     assert y_noncontiguous.shape == x.shape, "Output should have correct shape with non-contiguous seq_idx"
     
     # Check that SSM states are different (indicating seq_idx logic is working)
@@ -571,7 +545,7 @@ def test_seq_idx_parameter():
     
     # SSM states should be detectably different when chunks are non-contiguous
     assert ssm_state_diff > 1e-6, f"SSM states should differ for non-contiguous seq_idx, got diff={ssm_state_diff}"
-    
+
     print(f"  SSM state max diff: {ssm_state_diff:.6f}")
     print(f"  Output max diff: {output_diff:.6f}")
     print("✓ seq_idx parameter test passed")
@@ -581,19 +555,18 @@ def test_dA_cumsum_return():
     """Test that fused path can return dA_cumsum for backward."""
     print("\nTesting dA_cumsum return...")
     torch.manual_seed(42)
-    
+
     from mamba2 import mamba_split_conv1d_scan_combined
     from einops import rearrange
-    
+
     config = Mamba2Config(d_model=128, chunk_size=64)
     model = Mamba2(config)
-    
+
     batch, seqlen = 2, 64
     x = torch.randn(batch, seqlen, 128)
     zxbcdt = model.in_proj(x)
     A = -torch.exp(model.A_log)
-    
-    # Test with dA_cumsum
+
     with torch.no_grad():
         result = mamba_split_conv1d_scan_combined(
             zxbcdt,
@@ -615,16 +588,14 @@ def test_dA_cumsum_return():
             outproj_bias=model.out_proj.bias,
             return_dA_cumsum=True,
         )
-    
+
     assert len(result) == 3, "Should return (y, final_state, dA_cumsum)"
     y, final_state, dA_cumsum = result
-    
-    # Check dA_cumsum shape
+
     nchunks = seqlen // config.chunk_size
     assert dA_cumsum.shape == (batch, config.nheads, nchunks), \
         f"dA_cumsum should have shape (batch, nheads, nchunks), got {dA_cumsum.shape}"
-    
-    # Test with both dt_out and dA_cumsum
+
     with torch.no_grad():
         result_both = mamba_split_conv1d_scan_combined(
             zxbcdt,
@@ -647,14 +618,13 @@ def test_dA_cumsum_return():
             return_dt_out=True,
             return_dA_cumsum=True,
         )
-    
+
     assert len(result_both) == 4, "Should return (y, final_state, dt_out, dA_cumsum)"
     y_both, final_state_both, dt_out, dA_cumsum_both = result_both
-    
-    # Results should match
+
     assert torch.allclose(y, y_both), "Outputs should match regardless of return flags"
     assert torch.allclose(dA_cumsum, dA_cumsum_both), "dA_cumsum should match"
-    
+
     print("✓ dA_cumsum return test passed")
 
 
@@ -663,7 +633,7 @@ def run_all_tests():
     print("=" * 60)
     print("Running Mamba2 Unit Tests")
     print("=" * 60)
-    
+
     test_inverse_softplus()
     test_causal_conv1d()
     test_parameter_initialization()
@@ -681,7 +651,7 @@ def run_all_tests():
     test_dt_out_optional_return()
     test_seq_idx_parameter()
     test_dA_cumsum_return()
-    
+
     print("\n" + "=" * 60)
     print("All tests passed! ✓")
     print("=" * 60)

@@ -73,7 +73,7 @@ class InferenceCache(NamedTuple):
 
 def inverse_softplus(x: Tensor) -> Tensor:
     """Inverse of softplus function.
-    
+
     softplus(y) = log(1 + exp(y)), so y = log(exp(x) - 1)
     Numerically stable form: y = x + log(-expm1(-x))
     """
@@ -84,13 +84,13 @@ def causal_conv1d_pytorch(
     x: Tensor, weight: Tensor, bias: Tensor | None = None, activation: str = "silu"
 ) -> Tensor:
     """Pure PyTorch implementation of causal_conv1d with activation.
-    
+
     Arguments:
         x: (batch, seq_len, channels) input
         weight: (channels, kernel_width) grouped conv weight
         bias: (channels,) optional bias
         activation: "silu" or "swish"
-    
+
     Returns:
         (batch, seq_len, channels) output
     """
@@ -103,12 +103,12 @@ def causal_conv1d_pytorch(
     out = F.conv1d(x, w, bias=bias, padding=k - 1, groups=x.shape[1])
     # Truncate to original length (causal: only use past)
     out = out[:, :, :x.shape[2]]
-    
+
     if activation in ["silu", "swish"]:
         out = out * torch.sigmoid(out)
     else:
         raise NotImplementedError(f"Activation {activation} not implemented")
-    
+
     # Transpose back to (batch, seq_len, channels)
     return out.transpose(1, 2)
 
@@ -140,7 +140,7 @@ def mamba_split_conv1d_scan_combined(
     return_dA_cumsum: bool = False,
 ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
     """Pure PyTorch implementation of mamba_split_conv1d_scan_combined.
-    
+
     This fused operation combines:
     1. Split zxbcdt into z, xBC, dt
     2. Apply causal conv + activation to xBC
@@ -149,7 +149,7 @@ def mamba_split_conv1d_scan_combined(
     5. Apply D skip connection
     6. Apply RMSNorm with gating
     7. Apply output projection
-    
+
     Arguments:
         zxbcdt: (batch, seqlen, d_in_proj) concatenated input projections
         conv_weight: (conv_dim, kernel_width) convolution weight
@@ -174,7 +174,7 @@ def mamba_split_conv1d_scan_combined(
         initial_states: optional initial SSM states
         device: device for computation
         return_dt_out: whether to return dt_out for backward pass
-    
+
     Returns:
         out: (batch, seqlen, d_model) output
         final_state: (batch, nheads, headdim, d_state) final SSM state
@@ -182,36 +182,36 @@ def mamba_split_conv1d_scan_combined(
         dA_cumsum: cumulative A values for backward (optional, if return_dA_cumsum=True)
     """
     batch, seqlen, _ = zxbcdt.shape
-    
+
     # 1. Split input
     z, xBC, dt = torch.split(
         zxbcdt,
         [d_inner, d_inner + 2 * ngroups * d_state, nheads],
         dim=-1,
     )
-    
+
     # 2. Apply dt bias and softplus
     dt = F.softplus(dt + dt_bias)  # (batch, seqlen, nheads)
-    
+
     # Apply dt_limit if specified
     if dt_limit != (0.0, float("inf")):
         dt = torch.clamp(dt, min=dt_limit[0], max=dt_limit[1])
-    
+
     # 3. Apply causal convolution with activation
     xBC = causal_conv1d_pytorch(xBC, conv_weight, conv_bias, activation=activation)
-    
+
     # 4. Split xBC into x, B, C
     x, B, C = torch.split(
         xBC,
         [d_inner, ngroups * d_state, ngroups * d_state],
         dim=-1,
     )
-    
+
     # 5. Reshape for SSD
     x = rearrange(x, "b l (h p) -> b l h p", p=headdim)
     B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
     C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
-    
+
     # 6. Run SSD
     y, final_state = ssd(
         x * dt.unsqueeze(-1),
@@ -223,13 +223,13 @@ def mamba_split_conv1d_scan_combined(
         seq_idx=seq_idx,
         device=device,
     )
-    
+
     # 7. Apply D skip connection
     y = y + x * D.unsqueeze(-1)
-    
+
     # 8. Rearrange back
     y = rearrange(y, "b l h p -> b l (h p)")
-    
+
     # 9. Apply RMSNorm with gating
     if rmsnorm_weight is not None:
         if norm_before_gate:
@@ -240,11 +240,11 @@ def mamba_split_conv1d_scan_combined(
             # Gate first, then normalize (default)
             y = y * silu(z)
             y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + rmsnorm_eps) * rmsnorm_weight
-    
+
     # 10. Apply output projection
     if outproj_weight is not None:
         y = F.linear(y, outproj_weight, outproj_bias)
-    
+
     # Compute dA_cumsum if requested (for backward pass)
     # This is A * dt accumulated over the sequence
     dA_cumsum = None
@@ -356,7 +356,7 @@ class Mamba2LMHeadModel(nn.Module):
         input_ids: LongTensor,
         max_new_length: int = 20,
         temperature: float = 1.0,
-        top_k: int = 50,
+        top_k: float = 50,
         top_p: float = 1.0,
         eos_token_id: int = 0,
     ) -> Iterable[tuple[int, list[InferenceCache]]]:
@@ -385,7 +385,7 @@ class Mamba2LMHeadModel(nn.Module):
             if temperature != 1.0:
                 logits = logits / temperature
             if top_k > 0:
-                indices_to_remove = logits < torch.topk(logits, k=top_k)[0][-1]
+                indices_to_remove = logits < torch.topk(logits, k=int(top_k))[0][-1]
                 logits[indices_to_remove] = -torch.inf
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -488,9 +488,9 @@ class Mamba2(nn.Module):
             # initial_states shape: (nheads, headdim, d_state)
             # Need shape: (batch, 1, nheads, headdim, d_state) for ssd
             initial_states = repeat(self.init_states, "h p n -> b 1 h p n", b=batch)
-        
+
         zxbcdt = self.in_proj(u)  # (batch, seqlen, d_in_proj)
-        
+
         # Use fused path if enabled
         if self.args.use_mem_eff_path:
             y, ssm_state = mamba_split_conv1d_scan_combined(
@@ -535,12 +535,11 @@ class Mamba2(nn.Module):
             if seqlen >= self.args.d_conv:
                 conv_state = xBC_t[:, :, -self.args.d_conv:].clone()
             else:
-                # Pad if sequence is shorter than d_conv
                 conv_state = F.pad(xBC_t, (self.args.d_conv - seqlen, 0))
-            
+
             h = InferenceCache(conv_state, ssm_state)
             return y, h
-        
+
         # Simple (non-fused) path
         z, xBC, dt = torch.split(
             zxbcdt,
@@ -572,10 +571,10 @@ class Mamba2(nn.Module):
             )  # (batch, seqlen, d_inner + 2 * ngroups * d_state)
         else:
             raise NotImplementedError(f"Activation {self.args.activation} not implemented")
-            
+
         x, B, C = torch.split(
-            xBC, 
-            [self.args.d_inner, self.args.ngroups * self.args.d_state, self.args.ngroups * self.args.d_state], 
+            xBC,
+            [self.args.d_inner, self.args.ngroups * self.args.d_state, self.args.ngroups * self.args.d_state],
             dim=-1
         )
         x = rearrange(x, "b l (h p) -> b l h p", p=self.args.headdim)
@@ -583,7 +582,7 @@ class Mamba2(nn.Module):
         # Reshape B and C for ngroups
         B = rearrange(B, "b l (g n) -> b l g n", g=self.args.ngroups)
         C = rearrange(C, "b l (g n) -> b l g n", g=self.args.ngroups)
-        
+
         y, ssm_state = ssd(
             x * dt.unsqueeze(-1),
             A * dt,
@@ -644,39 +643,40 @@ class Mamba2(nn.Module):
             xBC += self.conv1d.bias
         xBC = silu(xBC)
 
+        # Split into x, B, C and reshape B/C appropriately
         x, B, C = torch.split(
-            xBC, 
-            [self.args.d_inner, self.args.ngroups * self.args.d_state, self.args.ngroups * self.args.d_state], 
+            xBC,
+            [self.args.d_inner, self.args.ngroups * self.args.d_state, self.args.ngroups * self.args.d_state],
             dim=-1
         )
-        A = -torch.exp(self.A_log)  # (nheads,)
 
+        # Reshape B, C to (batch, ngroups, d_state)
+        B = rearrange(B, "b (g n) -> b g n", g=self.args.ngroups)
+        C = rearrange(C, "b (g n) -> b g n", g=self.args.ngroups)
+
+        # Expand groups to heads if necessary
+        if self.args.ngroups < self.args.nheads:
+            heads_per_group = self.args.nheads // self.args.ngroups
+            B = repeat(B, "b g n -> b (g h) n", h=heads_per_group)
+            C = repeat(C, "b g n -> b (g h) n", h=heads_per_group)
+        # Now B and C are (batch, nheads, d_state)
+
+        A = -torch.exp(self.A_log)  # (nheads,)
         # SSM step
         dt = F.softplus(dt + self.dt_bias)  # (batch, nheads)
         
         # Apply dt_limit if specified
         if self.args.dt_limit != (0.0, float("inf")):
             dt = torch.clamp(dt, min=self.args.dt_limit[0], max=self.args.dt_limit[1])
-            
+
         dA = torch.exp(dt * A)  # (batch, nheads)
         x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
-        
-        # For ngroups support in step: expand B and C to per-head shapes
-        # When ngroups > 1, B and C have shape (batch, ngroups * d_state)
-        # We need to repeat groups to match heads
-        if self.args.ngroups < self.args.nheads:
-            # Reshape B and C for groups
-            B_grouped = rearrange(B, "b (g n) -> b g n", g=self.args.ngroups)
-            C_grouped = rearrange(C, "b (g n) -> b g n", g=self.args.ngroups)
-            # Repeat groups to heads
-            heads_per_group = self.args.nheads // self.args.ngroups
-            B = repeat(B_grouped, "b g n -> b (g h) n", h=heads_per_group)
-            C = repeat(C_grouped, "b g n -> b (g h) n", h=heads_per_group)
-        
+
+        # compute dBx with per-head B
         dBx = torch.einsum("bh, bhn, bhp -> bhpn", dt, B, x)
         h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
         y = torch.einsum("bhpn, bhn -> bhp", h.ssm_state, C)
-            
+
         y = y + rearrange(self.D, "h -> h 1") * x
         y = rearrange(y, "b h p -> b (h p)")
         y = self.norm(y, z)
@@ -778,6 +778,13 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, seq_idx=None, device: Devic
     # The key insight: seq_idx determines which chunks are contiguous in the global sequence
     # Non-contiguous chunks should not propagate states between them
     if seq_idx is not None and seq_idx.numel() > 0:
+        # normalize dtype/device and shape
+        if device is None:
+            device = A.device
+        seq_idx = seq_idx.to(device=device)
+        if seq_idx.dtype != torch.long:
+            seq_idx = seq_idx.long()
+
         batch_size = x.shape[0]
         nchunks = A_cumsum_last.shape[-1]
         
@@ -818,7 +825,7 @@ def ssd(x, A, B, C, chunk_size, initial_states=None, seq_idx=None, device: Devic
                     # In states array, this is index i (since states[0] is initial)
                     # Zero propagation from all chunks before break (states[0:i+1]) to chunks at/after break (new_states[i+1:])
                     decay_chunk[b, :, i+1:, :i+1] = 0
-    
+
     new_states = torch.einsum("bhzc, bchpn -> bzhpn", decay_chunk, states)
     states, final_state = new_states[:, :-1], new_states[:, -1]
 
@@ -852,11 +859,9 @@ class RMSNorm(nn.Module):
     def forward(self, x, z=None):
         if z is not None:
             if self.norm_before_gate:
-                # Normalize first, then gate
                 x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
                 x = x * silu(z)
             else:
-                # Gate first, then normalize (default behavior matching repo)
                 x = x * silu(z)
                 x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
         else:
@@ -865,8 +870,4 @@ class RMSNorm(nn.Module):
 
 
 def silu(x):
-    """Applies the Sigmoid Linear Unit (SiLU), element-wise.
-
-    Define this manually since torch's version doesn't seem to work on MPS.
-    """
     return x * F.sigmoid(x)
