@@ -1,8 +1,8 @@
 from transformers import MambaConfig, MambaForCausalLM, AutoTokenizer
 import torch
 
-tokenizer = AutoTokenizer.from_pretrained("state-spaces/mamba-790m-hf")
-model = MambaForCausalLM.from_pretrained("state-spaces/mamba-790m-hf")
+tokenizer = AutoTokenizer.from_pretrained("state-spaces/mamba-370m-hf")
+model = MambaForCausalLM.from_pretrained("state-spaces/mamba-370m-hf")
 # Return the attention mask and pass it to generate to avoid the warning
 q = "Write me a poem about a lonely computer:"
 inputs = tokenizer(q, return_tensors="pt", return_attention_mask=True)
